@@ -1,0 +1,3 @@
+api_keys:
+  VirusTotal: "8babeb3e9511c518bf04c88753eb43429a4b97f453d96f2ebce57571133e7c6d"
+  AlienVaultOTX: "your_alienvault_otx_api_key"
