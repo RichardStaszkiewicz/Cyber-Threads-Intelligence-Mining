@@ -1,3 +1,10 @@
+# custom
+model/BiLSTM-dynamic-att-LSTM/wandb/*
+.vscode/*
+*.pth
+*.dic
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
