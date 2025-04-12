@@ -19,6 +19,7 @@ id2label, label2id, label_list = load_dicts('data1/tag.dic')
 id2label[183] = 'no_entity'
 label2id['no_entity'] = 183
 label_list = [id2label[i] for i in sorted(id2label.keys())]
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 entity_types = set(i.split('_')[1] for i in label_list if i != 'O')
 relation_types = set(i.split('_')[2] for i in label_list if i != 'O' and len(i.split('_')) > 2)
@@ -34,6 +35,17 @@ for relation_type in relation_types:
 entity_counts = {}
 for entity_type in entity_types:
     entity_counts[entity_type] = {"TP": 0, "FP": 0, "FN": 0}
+    
+def get_entity_and_relation(label):
+    parts = label.split('_')
+    if label == 'O':  # 直接处理'O'标签的情况
+        return 'O', ''
+    elif len(parts) == 2:
+        return label, ''
+    elif len(parts) > 2:
+        return '_'.join(parts[:-2]), parts[-2]
+    else:
+        return None, None  # 对于不合法的标签格式
 
 def evaluate_classification(model, file_path):
     model.eval()
@@ -185,7 +197,7 @@ class BertBiLstmAttCRF(nn.Module):
 
 # ========== Optimizer and Scheduler ==========
 #BertModel.from_pretrained('bert-base-cased'),
-model = BertBiLstmAttCRF(len(label_list)).cuda()
+model = BertBiLstmAttCRF(len(label_list)).to(device)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, eps=1e-8, weight_decay=1e-4)
 
@@ -196,9 +208,9 @@ metric = ChunkEvaluator(label_list=label_list, suffix=False)
 def predict(text):
     model.eval()
     tokens = text.split()
-    enc = tokenizer(tokens, is_split_into_words=True, return_tensors='pt', max_length=max_seq_length, truncation=True)
-    input_ids = enc['input_ids'].cuda()
-    token_type_ids = enc['token_type_ids'].cuda()
+    enc = tokenizer(tokens, is_split_into_words=True, return_tensors='pt', max_length=max_seq_len, truncation=True)
+    input_ids = enc['input_ids'].to(device)
+    token_type_ids = enc['token_type_ids'].to(device)
     preds = model(input_ids, token_type_ids)
     pred_labels = preds[0]
     tags = [id2label[x] for x in pred_labels[1:-1]]  # remove [CLS] and [SEP]
@@ -209,7 +221,7 @@ def evaluate(model, metric, dataloader):
     model.eval()
     metric.reset()
     for batch in dataloader:
-        input_ids, token_type_ids, lengths, labels = [x.cuda() for x in batch]
+        input_ids, token_type_ids, lengths, labels = [x.to(device) for x in batch]
         preds = model(input_ids, token_type_ids)
         preds_padded = torch.full_like(labels, fill_value=no_entity_id)
         for i, p in enumerate(preds):
@@ -233,8 +245,8 @@ for epoch in range(num_train_epochs):
     model.train()
     for step, batch in enumerate(train_loader):
         global_step += 1
-        input_ids, token_type_ids, lengths, labels = [x.cuda() for x in batch]
-        loss = model(input_ids, token_type_ids, lengths=lengths, labels=labels).mean()
+        input_ids, token_type_ids, lengths, labels = [x.to(device) for x in batch]
+        loss = model(input_ids, token_type_ids, lengths=lengths, labels=labels).cpu().mean()
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
