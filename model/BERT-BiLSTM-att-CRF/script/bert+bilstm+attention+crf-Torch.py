@@ -10,6 +10,8 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import BertTokenizer, BertModel
 from TorchCRF import CRF
 import numpy as np
+import wandb
+from datetime import datetime
 
 from utils import *
 from ChunkEvaluatorTorch import ChunkEvaluator
@@ -241,6 +243,24 @@ tic_train = time.time()
 output_dir = 'model'
 os.makedirs(output_dir, exist_ok=True)
 
+date = datetime.today().strftime("%Y-%m-%d")
+nowname = f"bert-bilstm-att-crf_{date}"
+wandb.init(
+    name=nowname,
+    project="SPZC",
+    config={
+        "model": "BERT + BiLSTM + Attention + CRF",
+        "epochs": num_train_epochs,
+        "batch_size": batch_size,
+        "lr": 5e-5,
+        "weight_decay": 1e-4,
+        "max_seq_len": max_seq_len,
+        "dropout": 0.1,
+        "ignore_label": ignore_label,
+        "optimizer": "AdamW"
+    }
+)
+
 for epoch in range(num_train_epochs):
     model.train()
     for step, batch in enumerate(train_loader):
@@ -252,15 +272,25 @@ for epoch in range(num_train_epochs):
         optimizer.zero_grad()
 
         if global_step % logging_steps == 0:
+            wandb.log({
+                "train/loss": loss.item(),
+                "train/global_step": global_step,
+                "train/epoch": epoch
+            })
             print(f"global step {global_step}, epoch: {epoch}, batch: {step}, loss: {loss.item():.4f}, speed: {logging_steps / (time.time() - tic_train):.2f} step/s")
             tic_train = time.time()
 
     print("---- Evaluating on dev set ----")
     f1 = evaluate(model, metric, dev_loader)
-
-    if f1 > best_f1:
+    wandb.log({
+        "val/precision": metric.num_correct_chunks / metric.num_infer_chunks if metric.num_infer_chunks else 0.0,
+        "val/recall": metric.num_correct_chunks / metric.num_label_chunks if metric.num_label_chunks else 0.0,
+        "val/F1": f1,
+        "val/epoch": epoch
+    })
+    if f1 > best_f1 and f1 >= 0.4:
         print("Saving best model...")
-        torch.save(model.state_dict(), os.path.join(output_dir, "bert_bilstm_att_crf.pt"))
+        torch.save(model.state_dict(), f"checkpoints/{nowname}_best.pth")
         best_f1 = f1
 
         if f1 >= 0.5:
