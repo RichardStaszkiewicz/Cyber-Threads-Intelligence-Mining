@@ -1,5 +1,5 @@
 # custom
-model/BiLSTM-dynamic-att-LSTM/wandb/*
+model/*/wandb/*
 model/*/checkpoints/
 .vscode/*
 *.pth
