@@ -4,19 +4,23 @@
 import torch
 import time
 import os
+from mamba_ssm import Mamba
 from datetime import datetime
-from torch.cuda import is_available
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
+from s4 import S4Block
 import numpy as np
 import wandb  # For logging
 
 # Import custom utilities
 from utils import *
 from ChunkEvaluatorTorch import *
+
+
+MODEL = "BiLSTM-CRF"  # Choose from "BiLSTM-CRF", "BiLSTM-S4-CRF", "BiLSTM-Mamba-CRF", "BiS4-CRF"
 
 # Generate dictionary from training and dev files
 gernate_dic("data1/dev.txt", "data1/train.txt", "data1/tag.dic")
@@ -121,9 +125,9 @@ dev_loader = DataLoader(NERDataset(dev_data), batch_size=16, shuffle=False, coll
 class SelfAttention(nn.Module):
     def __init__(self, hidden_size):
         super(SelfAttention, self).__init__()
-        self.query = nn.Linear(hidden_size, hidden_size)
-        self.key = nn.Linear(hidden_size, hidden_size)
-        self.value = nn.Linear(hidden_size, hidden_size)
+        self.query = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.key = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.value = nn.Linear(hidden_size, hidden_size, bias=False)
         self.scale = hidden_size**0.5
 
     def forward(self, inputs, mask):
@@ -188,8 +192,172 @@ class BiLSTMCRF(nn.Module):
             return torch.argmax(output, dim=-1)
 
 
+class BiLSTMS4CRF(nn.Module):
+    def __init__(self, emb_size, hidden_size, word_num, label_num, char_vocab_size, char_emb_dim, alpha=10):
+        super().__init__()
+        self.word_emb = nn.Embedding(word_num, emb_size)
+        self.char_emb = nn.Embedding(char_vocab_size, char_emb_dim)
+
+        self.cnn = nn.Conv2d(in_channels=1, out_channels=char_emb_dim, kernel_size=(5, char_emb_dim), padding=(2, 0))
+
+        self.bilstm = nn.LSTM(emb_size + char_emb_dim, hidden_size, bidirectional=True, batch_first=True)
+        self.att = SelfAttention(hidden_size * 2)
+        self.bis4 = S4Block(hidden_size * 2, transposed=False, bidirectional=True, mode="nplr")
+        self.lstm = nn.LSTM(hidden_size * 2, hidden_size * 2, batch_first=True)
+        self.fc = nn.Linear(hidden_size * 2, label_num)
+        self.o_label_index = 195
+        self.alpha = alpha
+        self.loss_fn = self.custom_loss_fn  # nn.CrossEntropyLoss(reduction='none')
+
+    def custom_loss_fn(self, logits, labels):
+        standard_loss = F.cross_entropy(logits, labels, reduction="none")  # Compute standard CrossEntropyLoss
+        is_o_label = (labels == self.o_label_index).float()  # Identify 'O' labels
+        adjusted_loss = (1 - is_o_label) * self.alpha * standard_loss + is_o_label * standard_loss  # Adjust loss
+        return adjusted_loss.sum()
+
+    def forward(self, input_ids, char_input_ids, labels=None):
+        word_embs = self.word_emb(input_ids)
+
+        char_embs = self.char_emb(char_input_ids)  # Shape [B, Seq_Len, Max_Char_Len, Char_Emb_Dim]
+        char_embs = char_embs.view(
+            -1, 1, max_char_len, char_embs.shape[-1]
+        )  # Reshape to [B * Seq_Len, 1, Max_Char_Len, Char_Emb_Dim]
+        char_embs = self.cnn(char_embs).squeeze(2).max(dim=2)[0]  # CNN expects [B * Seq_Len, C, H, W]
+        char_embs = char_embs.view(
+            input_ids.shape[0], input_ids.shape[1], -1
+        )  # Reshape back to [B, Seq_Len, Char_Features]
+
+        concat_output = torch.cat([word_embs, char_embs], dim=-1)
+        output, _ = self.bilstm(concat_output)
+        output = self.att(output, input_ids != 0)
+        output, _ = self.bis4(output)
+        output, _ = self.lstm(output)
+        output = self.fc(output)
+
+        if labels is not None:
+            loss = self.loss_fn(output.view(-1, output.shape[-1]), labels.view(-1))
+            return loss
+        else:
+            return torch.argmax(output, dim=-1)
+        
+
+class BiLSTMMambaCRF(nn.Module):
+    def __init__(self, emb_size, hidden_size, word_num, label_num, char_vocab_size, char_emb_dim, alpha=10):
+        super().__init__()
+        self.word_emb = nn.Embedding(word_num, emb_size)
+        self.char_emb = nn.Embedding(char_vocab_size, char_emb_dim)
+
+        self.cnn = nn.Conv2d(in_channels=1, out_channels=char_emb_dim, kernel_size=(5, char_emb_dim), padding=(2, 0))
+
+        self.bilstm = nn.LSTM(emb_size + char_emb_dim, hidden_size, bidirectional=True, batch_first=True)
+        self.att = SelfAttention(hidden_size * 2)
+        self.mamba = Mamba(
+            d_model=hidden_size * 2,
+            d_state=32,
+            d_conv=4,
+            expand=2,
+        )
+        self.lstm = nn.LSTM(hidden_size * 2, hidden_size * 2, batch_first=True)
+        self.fc = nn.Linear(hidden_size * 2, label_num)
+        self.o_label_index = 195
+        self.alpha = alpha
+        self.loss_fn = self.custom_loss_fn  # nn.CrossEntropyLoss(reduction='none')
+
+    def custom_loss_fn(self, logits, labels):
+        standard_loss = F.cross_entropy(logits, labels, reduction="none")  # Compute standard CrossEntropyLoss
+        is_o_label = (labels == self.o_label_index).float()  # Identify 'O' labels
+        adjusted_loss = (1 - is_o_label) * self.alpha * standard_loss + is_o_label * standard_loss  # Adjust loss
+        return adjusted_loss.sum()
+
+    def forward(self, input_ids, char_input_ids, labels=None):
+        word_embs = self.word_emb(input_ids)
+
+        char_embs = self.char_emb(char_input_ids)  # Shape [B, Seq_Len, Max_Char_Len, Char_Emb_Dim]
+        char_embs = char_embs.view(
+            -1, 1, max_char_len, char_embs.shape[-1]
+        )  # Reshape to [B * Seq_Len, 1, Max_Char_Len, Char_Emb_Dim]
+        char_embs = self.cnn(char_embs).squeeze(2).max(dim=2)[0]  # CNN expects [B * Seq_Len, C, H, W]
+        char_embs = char_embs.view(
+            input_ids.shape[0], input_ids.shape[1], -1
+        )  # Reshape back to [B, Seq_Len, Char_Features]
+
+        concat_output = torch.cat([word_embs, char_embs], dim=-1)
+        output, _ = self.bilstm(concat_output)
+        output = self.att(output, input_ids != 0)
+        output = self.mamba(output)
+        output, _ = self.lstm(output)
+        output = self.fc(output)
+
+        if labels is not None:
+            loss = self.loss_fn(output.view(-1, output.shape[-1]), labels.view(-1))
+            return loss
+        else:
+            return torch.argmax(output, dim=-1)
+
+
+class BiS4CRF(nn.Module):
+    def __init__(self, emb_size, hidden_size, word_num, label_num, char_vocab_size, char_emb_dim, alpha=10):
+        super().__init__()
+        self.word_emb = nn.Embedding(word_num, emb_size)
+        self.char_emb = nn.Embedding(char_vocab_size, char_emb_dim)
+
+        self.cnn = nn.Conv2d(in_channels=1, out_channels=char_emb_dim, kernel_size=(5, char_emb_dim), padding=(2, 0))
+
+        self.ssm_in = S4Block(emb_size + char_emb_dim, transposed=False, bidirectional=True, mode="nplr")
+        self.proj_ssm = nn.Linear(emb_size + char_emb_dim, hidden_size, bias=False)
+        self.att = SelfAttention(hidden_size)
+        self.ssm_mid = S4Block(hidden_size, transposed=False, bidirectional=True, mode="nplr")
+        self.ssm_out = S4Block(hidden_size, transposed=False, bidirectional=True, mode="nplr")
+        self.fc = nn.Linear(hidden_size, label_num)
+        self.o_label_index = 195
+        self.alpha = alpha
+        self.loss_fn = self.custom_loss_fn
+
+    def forward(self, input_ids, char_input_ids, labels=None):
+        word_embs = self.word_emb(input_ids)
+
+        char_embs = self.char_emb(char_input_ids)  # Shape [B, Seq_Len, Max_Char_Len, Char_Emb_Dim]
+        char_embs = char_embs.view(
+            -1, 1, max_char_len, char_embs.shape[-1]
+        )  # Reshape to [B * Seq_Len, 1, Max_Char_Len, Char_Emb_Dim]
+        char_embs = self.cnn(char_embs).squeeze(2).max(dim=2)[0]  # CNN expects [B * Seq_Len, C, H, W]
+        char_embs = char_embs.view(
+            input_ids.shape[0], input_ids.shape[1], -1
+        )  # Reshape back to [B, Seq_Len, Char_Features]
+
+        concat_output = torch.cat([word_embs, char_embs], dim=-1)
+        output, _ = self.ssm_in(concat_output)
+        output = self.proj_ssm(output)
+        output = self.att(output, input_ids != 0)
+        output, _ = self.ssm_mid(output)
+        output, _ = self.ssm_out(output)
+        output = self.fc(output)
+
+        if labels is not None:
+            loss = self.loss_fn(output.view(-1, output.shape[-1]), labels.view(-1))
+            return loss
+        else:
+            return torch.argmax(output, dim=-1)
+    
+    def custom_loss_fn(self, logits, labels):
+        standard_loss = F.cross_entropy(logits, labels, reduction="none")  # Compute standard CrossEntropyLoss
+        is_o_label = (labels == self.o_label_index).float()  # Identify 'O' labels
+        adjusted_loss = (1 - is_o_label) * self.alpha * standard_loss + is_o_label * standard_loss  # Adjust loss
+        return adjusted_loss.sum()
+
+
+
 # Model and Optimizer
-model = BiLSTMCRF(300, 300, len(word_vocab), len(label_vocab), len(char_vocab), 15)
+if MODEL == "BiLSTM-S4-CRF":
+    model = BiLSTMS4CRF(300, 300, len(word_vocab), len(label_vocab), len(char_vocab), 15)
+elif MODEL == "BiLSTM-Mamba-CRF":
+    model = BiLSTMMambaCRF(300, 300, len(word_vocab), len(label_vocab), len(char_vocab), 15)
+elif MODEL == "BiS4-CRF":   
+    model = BiS4CRF(300, 300, len(word_vocab), len(label_vocab), len(char_vocab), 15)
+elif MODEL == "BiLSTM-CRF":
+    model = BiLSTMCRF(300, 300, len(word_vocab), len(label_vocab), len(char_vocab), 15)
+else:
+    raise ValueError("Invalid model name")
 if torch.cuda.is_available():
     model = model.cuda()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
@@ -356,7 +524,7 @@ def evaluate_v1(model, metric, data_loader):
 
 
 date = datetime.today().strftime("%Y-%m-%d")
-nowname = f"BiLSTM-dynamic-att-LSTM_{date}"
+nowname = f"{MODEL}_{date}"
 wandb.init(
     name=nowname,
     project="SPZC",

@@ -12,9 +12,14 @@ from TorchCRF import CRF
 import numpy as np
 import wandb
 from datetime import datetime
+from mamba_ssm import Mamba
+from s4 import S4Block
 
 from utils import *
 from ChunkEvaluatorTorch import ChunkEvaluator
+
+
+MODEL = "Mamba"  # Choose from 'BiLSTM', 'S4', or 'Mamba'
 
 gernate_dic('data1/dev.txt', 'data1/train.txt', 'data1/tag.dic')
 id2label, label2id, label_list = load_dicts('data1/tag.dic')
@@ -197,9 +202,69 @@ class BertBiLstmAttCRF(nn.Module):
             preds = self.crf.viterbi_decode(emissions, mask=mask)
             return preds
 
+
+class BertBiS4AttCRF(nn.Module):
+    def __init__(self, label_num, dropout=0.1, **kwargs):
+        super().__init__()
+        self.bert = BertModel.from_pretrained("bert-base-cased")
+        self.s4 = S4Block(self.bert.config.hidden_size, transposed=False, bidirectional=True, mode="nplr")
+        self.att = AttentionLayer(self.bert.config.hidden_size)
+        self.fc = nn.Linear(self.bert.config.hidden_size, label_num)
+        self.crf = CRF(num_labels=label_num)#, batch_first=True)
+
+    def forward(self, input_ids, token_type_ids, lengths=None, labels=None):
+        mask = input_ids != tokenizer.pad_token_id
+        bert_out = self.bert(input_ids, token_type_ids=token_type_ids).last_hidden_state
+        s4_out, _ = self.s4(bert_out)
+        attn_out = self.att(s4_out)
+        emissions = self.fc(attn_out)
+
+        if labels is not None:
+            loss = -self.crf(emissions, labels, mask=mask)
+            return loss
+        else:
+            preds = self.crf.viterbi_decode(emissions, mask=mask)
+            return preds
+
+
+class BertMambaAttCRF(nn.Module):
+    def __init__(self, label_num, dropout=0.1, **kwargs):
+        super().__init__()
+        self.bert = BertModel.from_pretrained("bert-base-cased")
+        self.mamba = Mamba(
+            d_model=self.bert.config.hidden_size,
+            d_state=32,
+            d_conv=4,
+            expand=2,
+        )
+        self.att = AttentionLayer(self.bert.config.hidden_size)
+        self.fc = nn.Linear(self.bert.config.hidden_size, label_num)
+        self.crf = CRF(num_labels=label_num)#, batch_first=True)
+
+    def forward(self, input_ids, token_type_ids, lengths=None, labels=None):
+        mask = input_ids != tokenizer.pad_token_id
+        bert_out = self.bert(input_ids, token_type_ids=token_type_ids).last_hidden_state
+        mamba_out = self.mamba(bert_out)
+        attn_out = self.att(mamba_out)
+        emissions = self.fc(attn_out)
+
+        if labels is not None:
+            loss = -self.crf(emissions, labels, mask=mask)
+            return loss
+        else:
+            preds = self.crf.viterbi_decode(emissions, mask=mask)
+            return preds
+
 # ========== Optimizer and Scheduler ==========
 #BertModel.from_pretrained('bert-base-cased'),
-model = BertBiLstmAttCRF(len(label_list)).to(device)
+if MODEL == 'BiLSTM':
+    model = BertBiLstmAttCRF(len(label_list)).to(device)
+elif MODEL == 'BiS4':
+    model = BertBiS4AttCRF(len(label_list)).to(device)
+elif MODEL == 'Mamba':
+    model = BertMambaAttCRF(len(label_list)).to(device)
+else:
+    raise ValueError("Invalid model type. Choose from 'LSTM', 'S4', or 'Mamba'.")
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, eps=1e-8, weight_decay=1e-4)
 
@@ -244,12 +309,12 @@ output_dir = 'model'
 os.makedirs(output_dir, exist_ok=True)
 
 date = datetime.today().strftime("%Y-%m-%d")
-nowname = f"bert-bilstm-att-crf_{date}"
+nowname = f"bert-{MODEL}-att-crf_{date}"
 wandb.init(
     name=nowname,
     project="SPZC",
     config={
-        "model": "BERT + BiLSTM + Attention + CRF",
+        "model": f"BERT + {MODEL} + Attention + CRF",
         "epochs": num_train_epochs,
         "batch_size": batch_size,
         "lr": 5e-5,
