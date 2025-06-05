@@ -1,0 +1,14 @@
+paddlenlp==2.1.1
+paddlepaddle-gpu==2.3.2
+paddlepaddle==3.0.0
+torch==2.7.1
+mamba-ssm==2.2.4
+transformers==4.52.4
+TorchCRF==1.1.0
+numpy==2.2.6
+wandb==0.20.1
+S4==0.4.4
+seqeval==1.2.2
+scipy==1.15.3
+pytorch-lightning==2.5.1
+einops==0.8.1
