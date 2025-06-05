@@ -1,6 +1,9 @@
 # Automotive cyber threat intelligence vith SSMs
+
 A derivative from original repository [here](https://github.com/AutoCS-wyh/Automotive-cyber-threat-intelligence-corpus).
 This repository includes the Torch impelemtation of the original paddlepaddle solutions and incorporating the SSMs into the original architectures.
+
+_Authors: Paweł Skierś, Richard Staszkiewicz (Warsaw University of Technology)_
 
 ## Data description
 Raw data: unstructured cybersecurity data (.txt files)
@@ -23,3 +26,6 @@ _Please be aware that to run an **6.**, you will be prompted to log in to your w
 ## Brat tool
 
 https://github.com/nlplab/brat/archive/refs/tags/v1.3p1.tar.gz. 
+
+## Additional assets
+A [main.ipynb](./main.ipynb) file is an undocumented support file used during development in an attempt to integrate the original code on the Google Colab environment. The authors attempt was unsuccessful, however artifact is left for anyone in future interested in rediscovering this route.
